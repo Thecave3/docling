@@ -2164,6 +2164,7 @@ class PdfPipelineOptions(PaginatedPipelineOptions):
             )
         ),
     ] = False
+
     force_backend_text: Annotated[
         bool,
         Field(
