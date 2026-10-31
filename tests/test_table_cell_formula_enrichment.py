@@ -38,6 +38,7 @@ from docling.models.stages.code_formula.code_formula_vlm_model import (
 from docling.models.stages.code_formula.table_cell_formula_vlm_model import (
     TableCellFormulaVlmModel,
 )
+from docling.models.utils.generation_utils import TailRepetitionStopper
 
 PAGE_SIZE = Size(width=612.0, height=792.0)
 # The stub's raw output, and what it must look like after post-processing.
@@ -79,13 +80,17 @@ class _FakePageBackend:
 
 
 def _make_code_formula_model(
-    *, extract_formulas: bool = True, engine: _DummyEngine | None = None
+    *,
+    extract_formulas: bool = True,
+    engine: _DummyEngine | None = None,
+    **preset_overrides,
 ) -> CodeFormulaVlmModel:
     model = CodeFormulaVlmModel.__new__(CodeFormulaVlmModel)
     model.enabled = extract_formulas
-    model.options = CodeFormulaVlmOptions.from_preset("codeformulav2").model_copy(
-        update={"extract_formulas": extract_formulas, "extract_code": False}
-    )
+    model.options = CodeFormulaVlmOptions.from_preset(
+        "codeformulav2", **preset_overrides
+    ).model_copy(update={"extract_formulas": extract_formulas, "extract_code": False})
+    model.expansion_factor = model.options.expansion_factor
     # engine is None exactly when the formula stage is disabled, which is what the table-cell
     # stage keys its own gate on.
     model.engine = (engine or _DummyEngine()) if extract_formulas else None
@@ -97,11 +102,12 @@ def _make_stage(
     enabled: bool = True,
     extract_formulas: bool = True,
     engine: _DummyEngine | None = None,
+    **preset_overrides,
 ) -> TableCellFormulaVlmModel:
     return TableCellFormulaVlmModel(
         enabled=enabled,
         code_formula_model=_make_code_formula_model(
-            extract_formulas=extract_formulas, engine=engine
+            extract_formulas=extract_formulas, engine=engine, **preset_overrides
         ),
     )
 
@@ -343,6 +349,49 @@ def test_crops_are_batched_for_the_engine_not_per_table() -> None:
 
 
 # ----------------------------------------------------------------------------- edge cases
+
+
+def _cell_formula_text(doc: DoclingDocument) -> str:
+    (cell,) = _rich_cells(doc.tables[0])
+    return cell.ref.resolve(doc).children[0].resolve(doc).text
+
+
+def test_a_looping_cell_transcription_is_cut_back() -> None:
+    looped = r"A y = \lambda x , \quad ( 9 4 ) " + r"\ " * 300
+    doc = _doc_with_tables([_cell("a^2 + 8 = 12", 0, 0)])
+    engine = _DummyEngine(text=looped)
+    _enrich(_make_stage(engine=engine), doc, _conv_res(doc))
+
+    assert _cell_formula_text(doc) == r"A y = \lambda x , \quad ( 9 4 )"
+    (sent,) = engine.received_inputs
+    stoppers = sent.extra_generation_config["custom_stopping_criteria"]
+    assert any(isinstance(s, TailRepetitionStopper) for s in stoppers)
+
+
+def test_repetition_handling_follows_the_formula_options() -> None:
+    looped = r"A y = \lambda x , \quad ( 9 4 ) " + r"\ " * 300
+    doc = _doc_with_tables([_cell("a^2 + 8 = 12", 0, 0)])
+    engine = _DummyEngine(text=looped)
+    _enrich(_make_stage(engine=engine, stop_on_repetition=False), doc, _conv_res(doc))
+
+    assert _cell_formula_text(doc) == looped.strip()
+    (sent,) = engine.received_inputs
+    assert "custom_stopping_criteria" not in sent.extra_generation_config
+
+
+@pytest.mark.parametrize("expansion_factor", [0.0, 0.08])
+def test_the_crop_margin_follows_the_formula_options(expansion_factor: float) -> None:
+    cell = _cell("a^2 + 8 = 12", 0, 0)
+    doc = _doc_with_tables([cell])
+    conv_res = _conv_res(doc)
+    stage = _make_stage(expansion_factor=expansion_factor)
+    _enrich(stage, doc, conv_res)
+
+    assert stage.expansion_factor == expansion_factor
+    (cropbox,) = conv_res.pages[0]._backend.cropboxes
+    expected = cell.bbox.expand_by_scale(expansion_factor, expansion_factor)
+    assert cropbox.width == pytest.approx(expected.width)
+    assert cropbox.height == pytest.approx(expected.height)
 
 
 def test_already_rich_cell_is_left_alone() -> None:

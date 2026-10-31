@@ -34,11 +34,13 @@ from pydantic import BaseModel, ConfigDict
 
 from docling.datamodel.base_models import Page
 from docling.datamodel.document import ConversionResult
+from docling.datamodel.progress import EnrichmentStep
 from docling.models.base_model import GenericEnrichmentModel
-from docling.models.inference_engines.vlm import VlmEngineInput
+from docling.models.inference_engines.vlm import VlmEngineInput, VlmEngineType
 from docling.models.stages.code_formula.code_formula_vlm_model import (
     CodeFormulaVlmModel,
 )
+from docling.models.utils.generation_utils import TailRepetitionStopper
 from docling.utils.utils import chunkify
 
 _log = logging.getLogger(__name__)
@@ -166,9 +168,12 @@ class _CropRequest(NamedTuple):
 class TableCellFormulaVlmModel(GenericEnrichmentModel[TableFormulaEnrichmentElement]):
     """Runs formula recognition over PDF table cells, emitting rich table cells."""
 
+    progress_step = EnrichmentStep.CODE_FORMULA
+
     # Aligned with CodeFormulaVlmModel so crops match the model's training data.
     images_scale: ClassVar[float] = 1.67  # = 120 dpi
-    expansion_factor: ClassVar[float] = 0.18
+    #: Crop margin. Taken from the formula stage, so `code_formula_options` tunes both.
+    expansion_factor: float = 0.18
 
     # One table per batch: crops are materialised eagerly, so batching tables only multiplies
     # live PIL images -- `__call__` re-chunks to `vlm_batch_size` anyway.
@@ -192,6 +197,13 @@ class TableCellFormulaVlmModel(GenericEnrichmentModel[TableFormulaEnrichmentElem
                 transcriptions stay identical to page-level ones.
         """
         self._code_formula_model = code_formula_model
+        self.expansion_factor = code_formula_model.expansion_factor
+        # Same stopper the formula stage uses, so a looping cell is cut short the same way.
+        self._repetition_stopper: Optional[TailRepetitionStopper] = (
+            TailRepetitionStopper()
+            if code_formula_model.options.stop_on_repetition
+            else None
+        )
         self.enabled = bool(
             enabled
             and code_formula_model.engine is not None
@@ -342,6 +354,17 @@ class TableCellFormulaVlmModel(GenericEnrichmentModel[TableFormulaEnrichmentElem
         engine = self._code_formula_model.engine
         assert engine is not None
         prompt = self._code_formula_model._get_prompt("formula")
+        extra_generation_config: dict = {
+            # Keep special tokens, so _post_process can strip them.
+            "skip_special_tokens": False,
+        }
+        # As in CodeFormulaVlmModel: API engines only get the repeated tail removed below.
+        if self._repetition_stopper is not None and not VlmEngineType.is_api_variant(
+            self._code_formula_model.options.engine_options.engine_type
+        ):
+            extra_generation_config["custom_stopping_criteria"] = [
+                self._repetition_stopper
+            ]
         try:
             outputs = engine.predict_batch(
                 [
@@ -350,10 +373,7 @@ class TableCellFormulaVlmModel(GenericEnrichmentModel[TableFormulaEnrichmentElem
                         prompt=prompt,
                         temperature=0.0,
                         max_new_tokens=2048,
-                        extra_generation_config={
-                            # Keep special tokens, so _post_process can strip them.
-                            "skip_special_tokens": False,
-                        },
+                        extra_generation_config=extra_generation_config,
                     )
                     for request in requests
                 ]
@@ -362,7 +382,10 @@ class TableCellFormulaVlmModel(GenericEnrichmentModel[TableFormulaEnrichmentElem
             # Mirrors CodeFormulaVlmModel: enrichment degrades, it never fails a conversion.
             _log.error(f"Error processing table cell formula batch: {exc}")
             return [""] * len(requests)
-        return self._code_formula_model._post_process([out.text for out in outputs])
+        texts = self._code_formula_model._post_process([out.text for out in outputs])
+        if self._repetition_stopper is not None:
+            texts = [self._repetition_stopper.strip(text) for text in texts]
+        return texts
 
     # ---------------------------------------------------------------- rich-cell writing
 
